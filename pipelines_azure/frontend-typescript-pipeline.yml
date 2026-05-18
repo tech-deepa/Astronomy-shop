@@ -1,0 +1,198 @@
+# Docker
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+  branches:
+    include:
+      - develop
+      - staging
+  paths:
+    include:
+      - src/frontend
+
+resources:
+- repo: self
+
+pool:
+  name: 'azureagent'
+
+variables:
+  tag: '$(Build.BuildId)'
+  ACR_NAME: ''
+  ACR_LOGIN_SERVER: '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME: " "
+  IMAGE_TAG: " "
+  SONAR_PROJECT_KEY: "opentelemetry"
+  NODE_VERSION: '20.x '
+  WORKING_DIRECTORY: '$(System.DefaultWorkingDirectory)/src/frontend'
+
+stages:
+- stage: 'Lint'
+  displayName: 'stage1- Lint'
+  jobs:
+  - job: 'Lint'
+    displayName: 'Lint job'
+    steps:
+    - checkout: self
+
+      ## This will install the node version based on input
+    - task: NodeTool@0
+      displayName: 'Use node version $(NODE_VERSION)'
+      inputs:
+        versionSpec: '$(NODE_VERSION)'
+
+    - task: Cache@2
+      inputs:
+        key: 'npm | $(Agent.OS) | package-lock.json'
+        restoreKeys: 'npm | $(Agent.OS)'
+        path: '$(WORKING_DIRECTORY)/node_modules'
+      
+    - script: npm ci
+      displayName: 'Install Dependencies (npm ci)'
+      workingDirectory: '$(WORKING_DIRECTORY)'
+
+    - script: |
+              echo "current working directory"
+              pwd
+              echo "----------------------"
+              ls
+              echo "-------------------------"
+              npm run lint
+      displayName: 'ESLint — Check for syntax & style errors'
+      workingDirectory: '$(WORKING_DIRECTORY)'
+
+  
+- stage: compile
+  displayName: 'Stage 2-Compile the type script'
+  dependsOn: Lint
+  condition: succeeded()
+  jobs:
+  - job: compile
+    displayName: 'compile Typescript'
+    steps:
+
+      - checkout: self
+      
+      - task: NodeTool@0
+        displayName: 'Install the node js'
+        inputs: 
+          versionSpec: '$(NODE_VERSION)'
+      
+      - task: Cache@2
+        inputs:
+          key: 'npm | $(Agent.OS) | package-lock.json'
+          path: 'node_modules'
+        
+      - script: npm ci
+        displayName: 'Install the dependencies'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      - script: npm run build
+        displayName: 'Compile the code to javascript'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(WORKING_DIRECTORY)/.next'
+          artifact: 'compiled-dist'
+          publishLocation: 'pipeline'
+
+- stage: UnitTest
+  displayName: 'Unit test'
+  jobs:
+  - job: Unittest
+    displayName: 'Run the unit test'
+    steps:
+      
+      - checkout: self
+
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+
+      - task: Cache@2
+        inputs:
+          key: 'npm | $(Agent.OS) | package-lock.json'
+          restoreKeys: 'npm | $(Agent.OS)'
+          path: node_modules
+          
+      - script: npm ci
+        displayName: "Install the dependencies"
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      - script: npm run test:ci
+        displayName: 'Run the unit test'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      - task: PublishTestResults@2
+        displayName: 'Publish Test Results'
+        condition: always()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/TEST-*.xml'
+          failTaskOnFailedTests: true
+
+      - task: PublishCodeCoverageResults@2
+        displayName: 'Publish code coverage'
+        condition: always()
+        inputs:
+          summaryFileLocation: '**/cobertura-coverage.xml'
+
+      - script: |
+          COVERAGE=$(cat coverage/coverage-summary.json | \
+            node -e "const d=require('/dev/stdin'); console.log(d.total.lines.pct)")
+          echo "Line coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "##[error]Coverage $COVERAGE% is below 80% threshold."
+            exit 1
+          fi
+        displayName: 'Enforce 80% Coverage Threshold'
+
+- stage: SAST
+  displayName: 'Static code analysis'
+  dependsOn: compile
+  condition: succeeded()
+  jobs:
+  - job: SAST
+    displayName: 'Static code analysis'
+    steps:
+      - checkout: self
+
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+
+      - task: Cache@2
+        inputs:
+          key: 'npm | $(Agent.OS) | package-lock.json'
+          restoreKeys: 'npm | $(Agent.OS)'
+          path: 'node_modules'
+
+      - script: npm ci
+        displayName: "Install dependencies"
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+
+      - task: SonarQubePrepare@8
+        displayName: 'Prepare SonarQube'
+        inputs:
+          SonarQube: 'sonarqube'
+          scannerMode: 'cli'
+          configMode: 'manual'
+          cliProjectKey: '$(SONAR_PROJECT_KEY)'
+          cliProjectName: 'My TypeScript Service'
+          cliSources: 'src/frontend'
+          extraProperties: |
+            sonar.language=ts
+            sonar.typescript.lcov.reportPaths=src/frontend/coverage/lcov.info
+            sonar.exclusions=**/node_modules/**,**/.next/**,**/cypress/**
+            sonar.sourceEncoding=UTF-8
+
+      - task: SonarQubeAnalyze@8
+        displayName: 'Run SonarQube Analysis'
+
+      - task: SonarQubePublish@8
+        displayName: 'Publish Quality Gate'
+        inputs:
+          pollingTimeoutSec: '300'
