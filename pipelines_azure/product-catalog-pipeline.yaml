@@ -1,0 +1,343 @@
+# Docker
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+  branches:
+    include:
+      - main
+      - staging
+  paths:
+    include:
+      - src/product-catalog
+
+resources:
+- repo: self
+
+pool:
+  name: 'azureagent'
+
+variables:
+  tag: '$(Build.BuildId)'
+  ACR_NAME: ''
+  ACR_LOGIN_SERVER: '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME: " "
+  IMAGE_TAG: " "
+  SONAR_PROJECT_KEY: "opentelemetry"
+  NODE_VERSION: '20.x '
+  WORKING_DIRECTORY: '$(System.DefaultWorkingDirectory)/src/product-catalog'
+  GO_VERSION: '1.22'
+  # Binary name
+  BINARY_NAME: 'product-catalog-service'
+
+stages:
+- stage: 'Lint'
+  displayName: 'stage1- Lint'
+  jobs:
+  - job: 'Lint'
+    displayName: 'Lint job'
+    steps:
+
+    - checkout: self
+
+      ## This will install the GO version based on input
+    - task: GoTool@0
+      displayName: 'Install Go $(GO_VERSION)'
+      inputs:
+        version: '$(GO_VERSION)'
+      
+    - script: go mod download
+      displayName: 'Download Go Modules'
+      workingDirectory: '$(WORKING_DIRECTORY)'
+
+    - script: |
+        # Install golangci-lint
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+          | sh -s -- -b $(go env GOPATH)/bin v1.57.0
+
+        echo "Running golangci-lint..."
+        golangci-lint run ./... \
+          --timeout 5m \
+          --out-format=colored-line-number
+      displayName: 'golangci-lint'
+      workingDirectory: '$(WORKING_DIRECTORY)'
+
+  
+- stage: compile
+  displayName: 'Stage 2-Compile the Go Build'
+  dependsOn: Lint
+  condition: succeeded()
+  jobs:
+  - job: compile
+    displayName: 'compile Go Binary'
+    steps:
+
+      - checkout: self
+      
+      - task: GoTool@0
+        displayName: 'Install Go $(GO_VERSION)'
+        inputs:
+          version: '$(GO_VERSION)'
+      
+      - script: go mod download
+        displayName: 'Download Go Modules'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      # go build — compile binary
+      # CGO_ENABLED=0 → no C deps → works in distroless Docker
+      # GOOS=linux    → compile for Linux even on Mac/Windows
+      # -ldflags      → strip debug info → smaller binary
+      - script: |
+          echo "Building binary..."
+          CGO_ENABLED=0 GOOS=linux go build \
+            -ldflags="-w -s" \
+            -o $(BINARY_NAME) \
+            main.go
+
+          echo "Binary size:"
+          ls -lh $(BINARY_NAME)
+        displayName: 'go build'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Binary'
+        inputs:
+          targetPath: '$(WORKING_DIRECTORY)/$(BINARY_NAME)'
+          artifact: 'go-binary'
+          publishLocation: 'pipeline'
+
+- stage: UnitTest
+  displayName: 'Stage 3 - Unit Tests'
+  jobs:
+  - job: Unittest
+    displayName: 'Run the unit test'
+    steps:
+      
+      - checkout: self
+
+      - task: GoTool@0
+        inputs:
+          version: '$(GO_VERSION)'
+
+      - script: go mod download
+        displayName: 'Download Go Modules'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      - script: |
+          echo "Running tests..."
+          go test ./... \
+            -v \
+            -coverprofile=coverage.out \
+            -covermode=atomic \
+            -timeout 120s
+
+          echo ""
+          echo "=== Coverage Summary ==="
+          go tool cover -func=coverage.out
+        displayName: 'go test with coverage'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+      # Convert to JUnit format for Azure DevOps Tests tab
+      - script: |
+          go install github.com/jstemmer/go-junit-report/v2@latest
+          go test ./... -v 2>&1 | go-junit-report -set-exit-code > junit.xml
+        displayName: 'Generate JUnit Report'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+        continueOnError: true   # dont fail if junit conversion fails
+
+
+      - task: PublishTestResults@2
+        displayName: 'Publish Test Results'
+        condition: always()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/TEST-*.xml'
+          failTaskOnFailedTests: true
+
+      - task: PublishCodeCoverageResults@2
+        displayName: 'Publish code coverage'
+        condition: always()
+        inputs:
+          summaryFileLocation: '$(WORKING_DIRECTORY)/coverage.out'
+
+      - script: |
+          COVERAGE=$(go tool cover -func=coverage.out \
+            | grep total \
+            | awk '{print $3}' \
+            | tr -d '%')
+          echo "Total Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+          echo "##[error]Coverage $COVERAGE% is below 80% threshold"
+          exit 1
+          fi
+          echo "##[section]Coverage check passed: $COVERAGE%"
+        displayName: 'Enforce 80% Coverage Threshold'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+    # Publish coverage.out for SonarQube stage
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Coverage for SonarQube'
+        inputs:
+          targetPath: '$(WORKING_DIRECTORY)/coverage.out'
+          artifact: 'go-coverage'
+          publishLocation: 'pipeline'
+
+- stage: SAST
+  displayName: 'Static code analysis'
+  dependsOn: compile
+  condition: succeeded()
+  jobs:
+  - job: SAST
+    displayName: 'Static code analysis'
+    steps:
+      - checkout: self
+
+      - task: GoTool@0
+        displayName: 'Install Go $(GO_VERSION)'
+        inputs:
+          version: '$(GO_VERSION)'
+
+      - script: mod go download
+        displayName: 'Download go modules'
+        workingDirectory: '$(WORKING_DIRECTORY)'
+
+
+      - task: SonarQubePrepare@8
+        displayName: 'Prepare SonarQube'
+        inputs:
+          SonarQube: 'sonarqube'
+          scannerMode: 'cli'
+          configMode: 'manual'
+          cliProjectKey: '$(SONAR_PROJECT_KEY)'
+          cliProjectName: 'My GO Service'
+          cliSources: 'src/product-catalog'
+          extraProperties: |
+            sonar.language=go
+            sonar.go.coverage.reportPaths=src/productcatalogservice/coverage.out
+            sonar.exclusions=**/vendor/**,**/*_test.go
+            sonar.sourceEncoding=UTF-8
+
+      - task: SonarQubeAnalyze@8
+        displayName: 'Run SonarQube Analysis'
+        inputs:
+          jdkVersion: 'default'
+      - task: SonarQubePublish@8
+        displayName: 'Publish Quality Gate'
+        inputs:
+          pollingTimeoutSec: '300'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 5 — Docker Build
+# Uses multi-stage Dockerfile
+# Stage 1: golang image compiles binary
+# Stage 2: distroless image runs binary (no OS, minimal attack surface)
+# ─────────────────────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: 'Stage 5 - Docker Build'
+  dependsOn: SAST
+  condition: succeeded()
+  jobs:
+  - job: DockerBuild
+    displayName: 'Build Docker Image'
+    steps:
+
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'ACR-ServiceConnection'
+
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: build
+        dockerfile: '$(WORKING_DIRECTORY)/Dockerfile'
+        buildContext: '$(System.DefaultWorkingDirectory)'
+        repository: '$(IMAGE_NAME)'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+        arguments: >
+          --build-arg BUILD_ID=$(Build.BuildId)
+          --build-arg GIT_COMMIT=$(Build.SourceVersion)
+          --no-cache
+
+    # Verify image was built
+    - script: |
+        echo "Built images:"
+        docker images | grep productcatalog
+      displayName: 'Verify Image Built'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 6 — Trivy Image Scan
+# Scans for OS + library vulnerabilities
+# HIGH or CRITICAL = pipeline blocked, image NOT pushed
+# ─────────────────────────────────────────────────────────────
+- stage: ImageScan
+  displayName: 'Stage 6 - Trivy Image Scan'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy Vulnerability Scan'
+    steps:
+
+    - script: |
+        # Install Trivy
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b /usr/local/bin
+
+        echo "Scanning image: $(IMAGE_NAME):$(IMAGE_TAG)"
+        trivy image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --format table \
+          --output trivy-image-report.txt \
+          $(IMAGE_NAME):$(IMAGE_TAG)
+      displayName: 'Trivy — Image Vulnerability Scan'
+      continueOnError: false   # blocks push if vulnerabilities found
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Trivy Report'
+      condition: always()      # publish even if scan fails
+      inputs:
+        pathToPublish: 'trivy-image-report.txt'
+        artifactName: 'security-reports'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 7 — Push to ACR
+# Only runs if ALL previous stages passed
+# Clean, tested, scanned image reaches registry
+# ─────────────────────────────────────────────────────────────
+- stage: PushACR
+  displayName: 'Stage 7 - Push to ACR'
+  dependsOn: ImageScan
+  condition: succeeded()
+  jobs:
+  - job: PushACR
+    displayName: 'Push Image to ACR'
+    steps:
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'ACR-ServiceConnection'
+
+    - task: Docker@2
+      displayName: 'Push to ACR'
+      inputs:
+        command: push
+        repository: '$(IMAGE_NAME)'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+    - script: |
+        echo "##[section]Image pushed successfully"
+        echo "Image: $(IMAGE_NAME):$(IMAGE_TAG)"
+      displayName: 'Confirm Push'
