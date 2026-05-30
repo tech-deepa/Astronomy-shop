@@ -196,3 +196,97 @@ stages:
         displayName: 'Publish Quality Gate'
         inputs:
           pollingTimeoutSec: '300'
+
+# ─────────────────────────────────────────────
+# STAGE 5 — Docker Build
+# ─────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: 'Stage 5 - Docker Build'
+  dependsOn: SAST
+  condition: succeeded()
+  jobs:
+  - job: DockerBuild
+    displayName: 'Build Docker Image'
+    
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'ACR-ServiceConnection'
+
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: build
+        dockerfile: '$(WORKING_DIRECTORY)/Dockerfile'
+        buildContext: '$(WORKING_DIRECTORY)'
+        repository: '$(IMAGE_NAME)'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+# ─────────────────────────────────────────────
+# STAGE 6 — Trivy Image Scan
+# Image still exists on same agent machine
+# ─────────────────────────────────────────────
+- stage: ImageScan
+  displayName: 'Stage 6 - Trivy Image Scan'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+  - job: ImageScan
+    displayName: 'Trivy Scan'
+
+    steps:
+
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b /usr/local/bin
+
+        trivy image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --format table \
+          --output trivy-report.txt \
+          $(IMAGE_NAME):$(IMAGE_TAG)
+      displayName: 'Trivy — Scan Image'
+      continueOnError: false
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: 'trivy-report.txt'
+        artifactName: 'security-reports'
+
+# ─────────────────────────────────────────────
+# STAGE 7 — Push to ACR
+# Only runs if scan passed
+# ─────────────────────────────────────────────
+- stage: PushACR
+  displayName: 'Stage 7 - Push to ACR'
+  dependsOn: ImageScan
+  condition: succeeded()
+  jobs:
+  - job: PushACR
+    displayName: 'Push Image to ACR'
+    
+    steps:
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'ACR-ServiceConnection'
+
+    - task: Docker@2
+      displayName: 'Push to ACR'
+      inputs:
+        command: push
+        repository: '$(IMAGE_NAME)'
+        tags: |
+          $(IMAGE_TAG)
+          latest

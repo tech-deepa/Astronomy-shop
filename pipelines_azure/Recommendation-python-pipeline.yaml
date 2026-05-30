@@ -1,0 +1,397 @@
+# ============================================================
+# Azure DevOps CI Pipeline — RecommendationService (Python)
+# OpenTelemetry Demo | tech-deepa
+#
+# Recommendation service is a Python gRPC service run via
+# `opentelemetry-instrument python recommendation_server.py`
+#
+# Python has NO compiler → Lint stage is ESSENTIAL here.
+# It is the first safety net before tests even run.
+#
+# Stages:
+#   1. Lint        — flake8 (style) + pylint (bugs/complexity)
+#   2. Test        — pytest + coverage
+#   3. SonarQube   — static analysis + quality gate
+#   4. DockerBuild — image build
+#   5. Trivy       — container vulnerability scan
+#   6. DockerPush  — push verified image to ACR
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - src/recommendationservice/**
+      - azure-pipelines-recommendationservice.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/recommendationservice/**
+
+variables:
+  ACR_NAME:          'youracrname'
+  ACR_LOGIN_SERVER:  '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME:        'recommendationservice'
+  IMAGE_TAG:         '$(Build.BuildId)'
+  IMAGE_FULL:        '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)'
+  SERVICE_PATH:      'src/recommendationservice'
+  PYTHON_VERSION:    '3.12'
+  SONAR_PROJECT_KEY: 'recommendationservice'
+
+stages:
+
+# ─────────────────────────────────────────────────────────────
+# Stage 1 — LINT
+# Python has no compiler. Lint IS the first safety net.
+# flake8  → style violations, undefined names, unused imports
+# pylint  → deeper analysis: complexity, bad patterns, type hints
+# Both run — flake8 is fast and strict, pylint is thorough.
+# ─────────────────────────────────────────────────────────────
+- stage: Lint
+  displayName: '1 · Lint'
+  jobs:
+  - job: PythonLint
+    displayName: 'flake8 + pylint'
+
+    steps:
+
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+
+    # Cache pip packages to speed up subsequent runs
+    - task: Cache@2
+      displayName: 'Cache pip packages'
+      inputs:
+        key:         'pip | "$(Agent.OS)" | $(SERVICE_PATH)/requirements.txt'
+        restoreKeys: 'pip | "$(Agent.OS)"'
+        path:        '$(HOME)/.cache/pip'
+
+    # Install app dependencies + lint tools
+    - script: |
+        pip install --upgrade pip
+        pip install -r $(SERVICE_PATH)/requirements.txt
+        pip install flake8 pylint
+      displayName: 'Install dependencies + lint tools'
+
+    # flake8: fast style + syntax check
+    # --max-line-length=120 matches most modern Python style guides
+    # --statistics shows count per error code
+    - script: |
+        flake8 $(SERVICE_PATH) \
+          --max-line-length=120 \
+          --exclude=__pycache__,.git \
+          --statistics \
+          --count
+      displayName: 'flake8 (style + syntax)'
+
+    # pylint: deeper static analysis
+    # --fail-under=7.0 means pipeline fails if score drops below 7/10
+    - script: |
+        pylint $(SERVICE_PATH)/*.py \
+          --max-line-length=120 \
+          --disable=C0114,C0115,C0116 \
+          --fail-under=7.0
+      displayName: 'pylint (static analysis)'
+      continueOnError: false
+
+    # Publish lint reports as artifacts so failures are readable
+    - script: |
+        flake8 $(SERVICE_PATH) \
+          --max-line-length=120 \
+          --exclude=__pycache__,.git \
+          --format=pylint \
+          --output-file=$(Build.ArtifactStagingDirectory)/flake8-report.txt || true
+        pylint $(SERVICE_PATH)/*.py \
+          --max-line-length=120 \
+          --disable=C0114,C0115,C0116 \
+          --output-format=text \
+          > $(Build.ArtifactStagingDirectory)/pylint-report.txt || true
+      displayName: 'Generate lint reports'
+      condition: always()
+
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      artifact: lint-reports
+      displayName: 'Publish lint reports'
+      condition: always()
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 2 — TEST
+# ─────────────────────────────────────────────────────────────
+- stage: Test
+  displayName: '2 · Test'
+  dependsOn: Lint
+  condition: succeeded()
+  jobs:
+  - job: PytestRun
+    displayName: 'pytest + Coverage'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+
+    - task: Cache@2
+      displayName: 'Restore pip cache'
+      inputs:
+        key:         'pip | "$(Agent.OS)" | $(SERVICE_PATH)/requirements.txt'
+        restoreKeys: 'pip | "$(Agent.OS)"'
+        path:        '$(HOME)/.cache/pip'
+
+    - script: |
+        pip install --upgrade pip
+        pip install -r $(SERVICE_PATH)/requirements.txt
+        pip install pytest pytest-cov
+      displayName: 'Install dependencies'
+
+    # Run pytest with coverage
+    # --junitxml produces the XML Azure DevOps needs for the Tests tab
+    # --cov-report=xml produces XML for SonarQube
+    - script: |
+        cd $(SERVICE_PATH)
+        pytest tests/ \
+          --junitxml=$(Build.ArtifactStagingDirectory)/test-results.xml \
+          --cov=. \
+          --cov-report=xml:$(Build.ArtifactStagingDirectory)/coverage.xml \
+          --cov-report=html:$(Build.ArtifactStagingDirectory)/coverage-html \
+          -v
+      displayName: 'Run pytest with coverage'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish test results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles:  '$(Build.ArtifactStagingDirectory)/test-results.xml'
+      condition: always()
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish code coverage'
+      inputs:
+        summaryFileLocation: '$(Build.ArtifactStagingDirectory)/coverage.xml'
+      condition: always()
+
+    # Pass coverage XML to SonarQube stage
+    - publish: '$(Build.ArtifactStagingDirectory)/coverage.xml'
+      artifact: coverage-report
+      displayName: 'Publish coverage artifact'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 3 — SONARQUBE
+# ─────────────────────────────────────────────────────────────
+- stage: SonarQube
+  displayName: '3 · SonarQube'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: SonarAnalysis
+    displayName: 'SonarQube Analysis + Quality Gate'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    # Full history needed for git blame in SonarQube
+    - checkout: self
+      fetchDepth: 0
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+
+    - script: |
+        pip install --upgrade pip
+        pip install -r $(SERVICE_PATH)/requirements.txt
+        pip install pytest pytest-cov
+      displayName: 'Install dependencies'
+
+    - download: current
+      artifact: coverage-report
+      displayName: 'Download coverage report'
+
+    # SonarQube for Python uses CLI scanner mode (not dotnet/gradle)
+    - task: SonarQubePrepare@6
+      displayName: 'Prepare SonarQube'
+      inputs:
+        SonarQube:   'SonarQube'              # Service connection name in Azure DevOps
+        scannerMode: 'CLI'
+        configMode:  'manual'
+        cliProjectKey: '$(SONAR_PROJECT_KEY)'
+        cliProjectName: 'RecommendationService'
+        cliSources:  '$(SERVICE_PATH)'
+        extraProperties: |
+          sonar.python.coverage.reportPaths=$(Pipeline.Workspace)/coverage-report/coverage.xml
+          sonar.python.version=$(PYTHON_VERSION)
+          sonar.exclusions=**/__pycache__/**,**/*.pyc
+
+    - task: SonarQubeAnalyze@6
+      displayName: 'Run SonarQube Analysis'
+
+    # Enforces quality gate — pipeline fails if gate is red
+    - task: SonarQubePublish@6
+      displayName: 'Enforce Quality Gate'
+      inputs:
+        pollingTimeoutSec: '300'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 4 — DOCKER BUILD
+# ─────────────────────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: '4 · Docker Build'
+  dependsOn: SonarQube
+  condition: succeeded()
+  jobs:
+  - job: BuildImage
+    displayName: 'Build Docker Image'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command:           'login'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command:           'build'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+        repository:        '$(IMAGE_NAME)'
+        dockerfile:        '$(SERVICE_PATH)/Dockerfile'
+        buildContext:      '$(SERVICE_PATH)'      # Python — no root-level proto refs
+        tags:              '$(IMAGE_TAG)'
+        arguments: >
+          --label "build.id=$(Build.BuildId)"
+          --label "build.branch=$(Build.SourceBranchName)"
+          --label "build.commit=$(Build.SourceVersion)"
+
+    - script: |
+        docker save $(IMAGE_FULL) | gzip > $(Build.ArtifactStagingDirectory)/recommendationservice-image.tar.gz
+      displayName: 'Export image as tar'
+
+    - publish: '$(Build.ArtifactStagingDirectory)/recommendationservice-image.tar.gz'
+      artifact: docker-image
+      displayName: 'Publish image tar'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 5 — TRIVY SECURITY SCAN
+# ─────────────────────────────────────────────────────────────
+- stage: Trivy
+  displayName: '5 · Trivy Security Scan'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy container scan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - download: current
+      artifact: docker-image
+      displayName: 'Download image tar'
+
+    - script: |
+        docker load < $(Pipeline.Workspace)/docker-image/recommendationservice-image.tar.gz
+        echo "Loaded: $(IMAGE_FULL)"
+      displayName: 'Load Docker image'
+
+    - script: |
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
+          | sudo tee /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update && sudo apt-get install -y trivy
+      displayName: 'Install Trivy'
+
+    - script: |
+        trivy image \
+          --exit-code 1 \
+          --severity CRITICAL \
+          --no-progress \
+          --format table \
+          $(IMAGE_FULL)
+      displayName: 'Trivy scan — fail on CRITICAL'
+
+    - script: |
+        trivy image \
+          --exit-code 0 \
+          --severity HIGH,CRITICAL \
+          --no-progress \
+          --format json \
+          --output $(Build.ArtifactStagingDirectory)/trivy-report.json \
+          $(IMAGE_FULL)
+      displayName: 'Trivy full JSON report'
+      condition: always()
+
+    - publish: '$(Build.ArtifactStagingDirectory)/trivy-report.json'
+      artifact: trivy-security-report
+      displayName: 'Publish Trivy report'
+      condition: always()
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 6 — DOCKER PUSH
+# Only runs if Trivy passed — no vulnerable images reach ACR.
+# ─────────────────────────────────────────────────────────────
+- stage: DockerPush
+  displayName: '6 · Docker Push'
+  dependsOn: Trivy
+  condition: succeeded()
+  jobs:
+  - job: PushImage
+    displayName: 'Push verified image to ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - download: current
+      artifact: docker-image
+      displayName: 'Download image tar'
+
+    - script: |
+        docker load < $(Pipeline.Workspace)/docker-image/recommendationservice-image.tar.gz
+        echo "Loaded: $(IMAGE_FULL)"
+      displayName: 'Load Docker image'
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command:           'login'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+
+    - task: Docker@2
+      displayName: 'Push image to ACR'
+      inputs:
+        command:           'push'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+        repository:        '$(IMAGE_NAME)'
+        tags:              '$(IMAGE_TAG)'
+
+    - script: |
+        echo "Successfully pushed: $(IMAGE_FULL)"
+        echo "##vso[task.setvariable variable=IMAGE_DIGEST;isOutput=true]$(IMAGE_FULL)"
+      displayName: 'Confirm push'
+      name: SetDigest

@@ -1,0 +1,342 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - src/adservice/**
+      - azure-pipelines-adservice.yml
+ 
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/adservice/**
+
+# ── Variables ─────────────────────────────────────────────────
+variables:
+  ACR_NAME:           'youracrname'
+  ACR_LOGIN_SERVER:   '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME:         'adservice'
+  IMAGE_TAG:          '$(Build.BuildId)'
+  IMAGE_FULL:         '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)'
+  SERVICE_PATH:       'src/adservice'
+  JAVA_VERSION:       '21'
+  SONAR_PROJECT_KEY:  'adservice'
+
+pool:
+  name: azureagent
+
+stages:
+
+# compile stage as this is statically typed langaugae
+
+- stage: Compile
+  displayName: Compile 
+  jobs:
+    - job: Compile
+      displayName: "Compile the code"
+      steps:
+
+        - checkout : self
+        
+        - task: JavaToolInstaller@0
+          displayName: 'Install Java $(JAVA_VERSION)'
+          inputs:
+            versionSpec:           '$(JAVA_VERSION)'
+            jdkArchitectureOption: 'x64'
+            jdkSourceOption:       'PreInstalled'
+
+        # cache save or restroes the dependencies
+
+        - task: Cache@2
+          displayName: 'Cache Gradle packages'
+          inputs:
+            key:          'gradle | "$(Agent.OS)" | $(SERVICE_PATH)/build.gradle.kts'
+            restoreKeys:  'gradle | "$(Agent.OS)"'
+            path:         '$(HOME)/.gradle/caches'
+
+        - script: chmod +x $(SERVICE_PATH)/gradlew
+          displayName: 'chmod gradlew'
+
+        - task: Gradle@3
+          displayName: 'Gradle Build'
+          inputs:
+            workingDirectory:    '$(SERVICE_PATH)'
+            gradleWrapperFile:   '$(SERVICE_PATH)/gradlew'
+            tasks:               'installDist'
+            javaHomeOption:      'JDKVersion'
+            jdkVersionOption:    '$(JAVA_VERSION)'
+            options:             '--no-daemon' 
+
+        # Pass the compiled distribution to downstream stages
+        - publish: '$(SERVICE_PATH)/build/install'
+          artifact: adservice-dist
+          displayName: 'Publish compiled artifact'
+
+# ─────────────────────────────────────────────────────────────
+# Stage 2 — TEST
+# ─────────────────────────────────────────────────────────────
+- stage: Test
+  displayName: '2 · Test'
+  dependsOn: Compile
+  condition: succeeded()
+  jobs:
+    - job: UnitTest
+      displayName: 'Run Unit Tests'
+      steps:
+
+        - checkout: self
+
+        - task: JavaToolInstaller@0
+          displayName: 'Install Java $(JAVA_VERSION)'
+          inputs:
+            versionSpec:           '$(JAVA_VERSION)'
+            jdkArchitectureOption: 'x64'
+            jdkSourceOption:       'PreInstalled'
+
+        - task: Cache@2
+          displayName: 'Restore Gradle cache'
+          inputs:
+            key:         'gradle | "$(Agent.OS)" | $(SERVICE_PATH)/build.gradle.kts'
+            restoreKeys: 'gradle | "$(Agent.OS)"'
+            path:        '$(HOME)/.gradle/caches'
+
+        - script: chmod +x $(SERVICE_PATH)/gradlew
+          displayName: 'chmod gradlew'
+
+        # Run tests and generate JaCoCo coverage report in one command
+        - task: Gradle@3
+          displayName: 'Run Tests + JaCoCo Coverage'
+          inputs:
+            workingDirectory:    '$(SERVICE_PATH)'
+            gradleWrapperFile:   '$(SERVICE_PATH)/gradlew'
+            tasks:               'test jacocoTestReport'
+            publishJUnitResults: true
+            testResultsFiles:    '**/TEST-*.xml'
+            javaHomeOption:      'JDKVersion'
+            jdkVersionOption:    '$(JAVA_VERSION)'
+            options:             '--no-daemon'
+
+        # Publish JaCoCo HTML + XML reports as pipeline artifacts
+        - task: PublishCodeCoverageResults@2
+          displayName: 'Publish JaCoCo Coverage'
+          inputs:
+            summaryFileLocation: '$(SERVICE_PATH)/build/reports/jacoco/test/jacocoTestReport.xml'
+            pathToSources:       '$(SERVICE_PATH)/src/main/java'
+          continueOnError: true
+
+        # Pass coverage report to SonarQube stage
+        - publish: '$(SERVICE_PATH)/build/reports/jacoco'
+          artifact: jacoco-report
+          displayName: 'Publish JaCoCo artifact'
+
+# ─────────────────────────────────────────────────────────────
+# Stage 3 — SONARQUBE
+# ─────────────────────────────────────────────────────────────
+- stage: SonarQube
+  displayName: '3 · SonarQube'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+    - job: SonarQubeAnalysis
+      displayName: 'SonarQube Analysis + Quality Gate'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+
+        # Full history needed — SonarQube uses git blame for issue dating
+        - checkout: self
+          fetchDepth: 0
+
+        - task: JavaToolInstaller@0
+          displayName: 'Install Java $(JAVA_VERSION)'
+          inputs:
+            versionSpec:           '$(JAVA_VERSION)'
+            jdkArchitectureOption: 'x64'
+            jdkSourceOption:       'PreInstalled'
+
+        - task: Cache@2
+          displayName: 'Restore Gradle cache'
+          inputs:
+            key:         'gradle | "$(Agent.OS)" | $(SERVICE_PATH)/build.gradle.kts'
+            restoreKeys: 'gradle | "$(Agent.OS)"'
+            path:        '$(HOME)/.gradle/caches'
+
+        - script: chmod +x $(SERVICE_PATH)/gradlew
+          displayName: 'chmod gradlew'
+
+        # Download the JaCoCo report produced in the Test stage
+        - download: current
+          artifact: jacoco-report
+          displayName: 'Download JaCoCo report'
+
+        # Connect to SonarQube server before running the scan
+        - task: SonarQubePrepare@6
+          displayName: 'Prepare SonarQube'
+          inputs:
+            SonarQube:   'SonarQube'          # Service connection name in Azure DevOps
+            scannerMode: 'Other'
+            extraProperties: |
+              sonar.projectKey=$(SONAR_PROJECT_KEY)
+              sonar.projectName=AdService
+              sonar.sources=$(SERVICE_PATH)/src/main/java
+              sonar.tests=$(SERVICE_PATH)/src/test/java
+              sonar.java.binaries=$(SERVICE_PATH)/build/classes
+              sonar.coverage.jacoco.xmlReportPaths=$(Pipeline.Workspace)/jacoco-report/test/jacocoTestReport.xml
+
+        - task: Gradle@3
+          displayName: 'Run SonarQube Scan'
+          inputs:
+            workingDirectory:     '$(SERVICE_PATH)'
+            gradleWrapperFile:    '$(SERVICE_PATH)/gradlew'
+            tasks:                'sonarqube'
+            sonarQubeRunAnalysis: true
+            javaHomeOption:       'JDKVersion'
+            jdkVersionOption:     '$(JAVA_VERSION)'
+            options:              '--no-daemon'
+
+        # Enforce quality gate — pipeline fails if gate is red
+        - task: SonarQubePublish@6
+          displayName: 'Enforce Quality Gate'
+          inputs:
+            pollingTimeoutSec: '300'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 4 — DOCKER BUILD
+# ─────────────────────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: '4 · Docker Build'
+  dependsOn: SonarQube
+  condition: succeeded()
+  jobs:
+    - job: BuildImage
+      displayName: 'Build Docker Image'
+    
+      steps:
+
+        - checkout: self
+
+        # Download compiled dist so Docker doesn't need to re-run Gradle
+        - download: current
+          artifact: adservice-dist
+          displayName: 'Download compiled artifact'
+
+        - task: Docker@2
+          displayName: 'Login to ACR'
+          inputs:
+            command:           'login'
+            containerRegistry: 'ACR_SERVICE_CONNECTION'   # Replace with your service connection name
+
+        # Build context is repo root — Dockerfile references /pb proto files at root level
+        - task: Docker@2
+          displayName: 'Build Docker Image'
+          inputs:
+            command:           'build'
+            containerRegistry: 'ACR_SERVICE_CONNECTION'
+            repository:        '$(IMAGE_NAME)'
+            dockerfile:        '$(SERVICE_PATH)/Dockerfile'
+            buildContext:      '.'
+            tags: |
+              $(IMAGE_TAG)
+            arguments: >
+              --build-arg OTEL_JAVA_AGENT_VERSION=2.1.0
+              --label "build.id=$(Build.BuildId)"
+              --label "build.branch=$(Build.SourceBranchName)"
+              --label "build.commit=$(Build.SourceVersion)"
+
+        # Save image as tar so Docker Push stage doesn't need to rebuild
+        - script: |
+            docker save $(IMAGE_FULL) | gzip > $(Build.ArtifactStagingDirectory)/adservice-image.tar.gz
+          displayName: 'Export image as tar'
+
+        - publish: '$(Build.ArtifactStagingDirectory)/adservice-image.tar.gz'
+          artifact: docker-image
+          displayName: 'Publish image tar artifact'
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 5 — Trivy Image Scan
+# Scans for OS + library vulnerabilities
+# HIGH or CRITICAL = pipeline blocked, image NOT pushed
+# ─────────────────────────────────────────────────────────────
+- stage: ImageScan
+  displayName: 'Stage 5 - Trivy Image Scan'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy Vulnerability Scan'
+    steps:
+
+    - script: |
+        # Install Trivy
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b /usr/local/bin
+
+        echo "Scanning image: $(IMAGE_NAME):$(IMAGE_TAG)"
+        trivy image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --format table \
+          --output trivy-image-report.txt \
+          $(IMAGE_NAME):$(IMAGE_TAG)
+      displayName: 'Trivy — Image Vulnerability Scan'
+      continueOnError: false   # blocks push if vulnerabilities found
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Trivy Report'
+      condition: always()      # publish even if scan fails
+      inputs:
+        pathToPublish: 'trivy-image-report.txt'
+        artifactName: 'security-reports'
+
+# ─────────────────────────────────────────────────────────────
+# Stage 6 — DOCKER PUSH
+# ─────────────────────────────────────────────────────────────
+- stage: DockerPush
+  displayName: '6 · Docker Push'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+    - job: PushImage
+      displayName: 'Push Image to ACR'
+      
+      steps:
+
+        # Download the image tar built in Stage 4 — no rebuild needed
+        - download: current
+          artifact: docker-image
+          displayName: 'Download image tar'
+
+        # Load the image back into Docker daemon
+        - script: |
+            docker load < $(Pipeline.Workspace)/docker-image/adservice-image.tar.gz
+            echo "Loaded image: $(IMAGE_FULL)"
+          displayName: 'Load Docker image'
+
+        - task: Docker@2
+          displayName: 'Login to ACR'
+          inputs:
+            command:           'login'
+            containerRegistry: 'ACR_SERVICE_CONNECTION'
+
+        - task: Docker@2
+          displayName: 'Push image to ACR'
+          inputs:
+            command:           'push'
+            containerRegistry: 'ACR_SERVICE_CONNECTION'
+            repository:        '$(IMAGE_NAME)'
+            tags:              '$(IMAGE_TAG)'
+
+        # Print the digest of the pushed image — useful for CD pipeline traceability
+        - script: |
+            IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $(IMAGE_FULL))
+            echo "Pushed image digest: $IMAGE_DIGEST"
+            echo "##vso[task.setvariable variable=IMAGE_DIGEST;isOutput=true]$IMAGE_DIGEST"
+          displayName: 'Print image digest'
+          name: SetDigest

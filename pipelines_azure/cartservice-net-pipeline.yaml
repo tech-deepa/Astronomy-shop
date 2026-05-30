@@ -1,0 +1,390 @@
+# ============================================================
+# Azure DevOps CI Pipeline — CartService (.NET / C#)
+# OpenTelemetry Demo | tech-deepa
+#
+# Cart service is an ASP.NET Core gRPC service backed by Redis.
+# .NET has a compiler — so no dedicated Lint stage.
+# Instead, `dotnet format --verify-no-changes` runs inside
+# Compile as a formatting check (Roslyn analyzers fire during build).
+#
+# Stages:
+#   1. Compile     — dotnet format check + dotnet build
+#   2. Test        — dotnet test + code coverage
+#   3. SonarQube   — static analysis + quality gate
+#   4. DockerBuild — multi-stage image build
+#   5. Trivy       — container vulnerability scan
+#   6. DockerPush  — push verified image to ACR
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - src/cartservice/**
+      - azure-pipelines-cartservice.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/cartservice/**
+
+variables:
+  ACR_NAME:          'youracrname'
+  ACR_LOGIN_SERVER:  '$(ACR_NAME).azurecr.io'
+  IMAGE_NAME:        'cartservice'
+  IMAGE_TAG:         '$(Build.BuildId)'
+  IMAGE_FULL:        '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)'
+  SERVICE_PATH:      'src/cartservice'
+  DOTNET_VERSION:    '8.0.x'
+  SONAR_PROJECT_KEY: 'cartservice'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true   # speeds up agent setup
+  DOTNET_NOLOGO: true
+
+stages:
+
+# ─────────────────────────────────────────────────────────────
+# Stage 1 — COMPILE
+# No separate Lint stage for .NET — the compiler and Roslyn
+# analyzers catch type errors, null refs, and code style issues
+# during build. `dotnet format` handles formatting enforcement.
+# ─────────────────────────────────────────────────────────────
+- stage: Compile
+  displayName: '1 · Compile'
+  jobs:
+  - job: DotnetBuild
+    displayName: 'Format Check + dotnet build'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+
+    - task: UseDotNet@2
+      displayName: 'Install .NET $(DOTNET_VERSION)'
+      inputs:
+        packageType: 'sdk'
+        version:     '$(DOTNET_VERSION)'
+
+    # Cache NuGet packages to avoid re-downloading on every run
+    - task: Cache@2
+      displayName: 'Cache NuGet packages'
+      inputs:
+        key:         'nuget | "$(Agent.OS)" | $(SERVICE_PATH)/src/cart.csproj'
+        restoreKeys: 'nuget | "$(Agent.OS)"'
+        path:        '$(HOME)/.nuget/packages'
+
+    # Restore dependencies before any other dotnet command
+    - script: dotnet restore $(SERVICE_PATH)/src/cart.csproj
+      displayName: 'dotnet restore'
+
+    # Enforce code formatting — fails if any file is not formatted.
+    # Equivalent of a lint check for .NET (replaces a separate Lint stage).
+    - script: |
+        dotnet format $(SERVICE_PATH)/src/cart.csproj \
+          --verify-no-changes \
+          --no-restore
+      displayName: 'dotnet format (formatting check)'
+
+    # Build in Release mode — Roslyn analyzers fire here and
+    # catch real issues: nullable refs, unused vars, bad patterns.
+    # -warnaserror promotes analyzer warnings to build failures.
+    - script: |
+        dotnet build $(SERVICE_PATH)/src/cart.csproj \
+          --configuration Release \
+          --no-restore \
+          -warnaserror
+      displayName: 'dotnet build'
+
+    # Publish the compiled output for the Docker stage
+    - script: |
+        dotnet publish $(SERVICE_PATH)/src/cart.csproj \
+          --configuration Release \
+          --no-restore \
+          --output $(Build.ArtifactStagingDirectory)/publish
+      displayName: 'dotnet publish'
+
+    - publish: '$(Build.ArtifactStagingDirectory)/publish'
+      artifact: cartservice-publish
+      displayName: 'Publish compiled artifact'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 2 — TEST
+# ─────────────────────────────────────────────────────────────
+- stage: Test
+  displayName: '2 · Test'
+  dependsOn: Compile
+  condition: succeeded()
+  jobs:
+  - job: DotnetTest
+    displayName: 'Unit Tests + Coverage'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+
+    - task: UseDotNet@2
+      displayName: 'Install .NET $(DOTNET_VERSION)'
+      inputs:
+        packageType: 'sdk'
+        version:     '$(DOTNET_VERSION)'
+
+    - task: Cache@2
+      displayName: 'Restore NuGet cache'
+      inputs:
+        key:         'nuget | "$(Agent.OS)" | $(SERVICE_PATH)/src/cart.csproj'
+        restoreKeys: 'nuget | "$(Agent.OS)"'
+        path:        '$(HOME)/.nuget/packages'
+
+    - script: dotnet restore $(SERVICE_PATH)/src/cart.csproj
+      displayName: 'dotnet restore'
+
+    # Run tests with Coverlet for code coverage (cobertura format for AzDO)
+    - script: |
+        dotnet test $(SERVICE_PATH)/src/cart.csproj \
+          --configuration Release \
+          --no-restore \
+          --logger "trx;LogFileName=test-results.trx" \
+          --collect:"XPlat Code Coverage" \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+      displayName: 'dotnet test + coverage'
+
+    # Publish TRX test results — shows pass/fail in Tests tab
+    - task: PublishTestResults@2
+      displayName: 'Publish test results'
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles:  '**/*.trx'
+      condition: always()
+
+    # Publish Cobertura coverage — shows in Code Coverage tab
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish code coverage'
+      inputs:
+        summaryFileLocation: '**/coverage.cobertura.xml'
+      condition: always()
+
+    # Pass coverage file to SonarQube stage
+    - publish: '$(Agent.TempDirectory)'
+      artifact: coverage-report
+      displayName: 'Publish coverage artifact'
+      condition: always()
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 3 — SONARQUBE
+# ─────────────────────────────────────────────────────────────
+- stage: SonarQube
+  displayName: '3 · SonarQube'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: SonarAnalysis
+    displayName: 'SonarQube Analysis + Quality Gate'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    # Full git history needed for blame-based issue dating
+    - checkout: self
+      fetchDepth: 0
+
+    - task: UseDotNet@2
+      displayName: 'Install .NET $(DOTNET_VERSION)'
+      inputs:
+        packageType: 'sdk'
+        version:     '$(DOTNET_VERSION)'
+
+    # SonarQube uses its own Java-based scanner for .NET
+    - task: SonarQubePrepare@6
+      displayName: 'Prepare SonarQube'
+      inputs:
+        SonarQube:      'SonarQube'              # Service connection name in Azure DevOps
+        scannerMode:    'dotnet'
+        projectKey:     '$(SONAR_PROJECT_KEY)'
+        projectName:    'CartService'
+        extraProperties: |
+          sonar.cs.opencover.reportsPaths=$(Pipeline.Workspace)/coverage-report/**/coverage.cobertura.xml
+          sonar.exclusions=**/obj/**,**/bin/**
+
+    - script: |
+        dotnet restore $(SERVICE_PATH)/src/cart.csproj
+        dotnet build $(SERVICE_PATH)/src/cart.csproj \
+          --configuration Release \
+          --no-restore
+      displayName: 'dotnet build for SonarQube'
+
+    - download: current
+      artifact: coverage-report
+      displayName: 'Download coverage report'
+
+    - task: SonarQubeAnalyze@6
+      displayName: 'Run SonarQube Analysis'
+
+    # Fails the pipeline if quality gate is red
+    - task: SonarQubePublish@6
+      displayName: 'Enforce Quality Gate'
+      inputs:
+        pollingTimeoutSec: '300'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 4 — DOCKER BUILD
+# ─────────────────────────────────────────────────────────────
+- stage: DockerBuild
+  displayName: '4 · Docker Build'
+  dependsOn: SonarQube
+  condition: succeeded()
+  jobs:
+  - job: BuildImage
+    displayName: 'Build Docker Image'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command:           'login'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+
+    # Build context is repo root — Dockerfile may reference proto files
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command:           'build'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+        repository:        '$(IMAGE_NAME)'
+        dockerfile:        '$(SERVICE_PATH)/Dockerfile'
+        buildContext:      '.'
+        tags:              '$(IMAGE_TAG)'
+        arguments: >
+          --label "build.id=$(Build.BuildId)"
+          --label "build.branch=$(Build.SourceBranchName)"
+          --label "build.commit=$(Build.SourceVersion)"
+
+    # Save image as tar so Trivy and DockerPush stages
+    # don't need to rebuild or re-pull from ACR
+    - script: |
+        docker save $(IMAGE_FULL) | gzip > $(Build.ArtifactStagingDirectory)/cartservice-image.tar.gz
+      displayName: 'Export image as tar'
+
+    - publish: '$(Build.ArtifactStagingDirectory)/cartservice-image.tar.gz'
+      artifact: docker-image
+      displayName: 'Publish image tar'
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 5 — TRIVY SECURITY SCAN
+# Pipeline fails on CRITICAL CVEs — image is not pushed if it
+# has critical vulnerabilities.
+# ─────────────────────────────────────────────────────────────
+- stage: Trivy
+  displayName: '5 · Trivy Security Scan'
+  dependsOn: DockerBuild
+  condition: succeeded()
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy container scan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - download: current
+      artifact: docker-image
+      displayName: 'Download image tar'
+
+    - script: |
+        docker load < $(Pipeline.Workspace)/docker-image/cartservice-image.tar.gz
+        echo "Image loaded: $(IMAGE_FULL)"
+      displayName: 'Load Docker image'
+
+    - script: |
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
+          | sudo tee /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update && sudo apt-get install -y trivy
+      displayName: 'Install Trivy'
+
+    # Fail pipeline on any CRITICAL vulnerability
+    - script: |
+        trivy image \
+          --exit-code 1 \
+          --severity CRITICAL \
+          --no-progress \
+          --format table \
+          $(IMAGE_FULL)
+      displayName: 'Trivy scan — fail on CRITICAL'
+
+    # Full HIGH+CRITICAL report saved as artifact regardless of result
+    - script: |
+        trivy image \
+          --exit-code 0 \
+          --severity HIGH,CRITICAL \
+          --no-progress \
+          --format json \
+          --output $(Build.ArtifactStagingDirectory)/trivy-report.json \
+          $(IMAGE_FULL)
+      displayName: 'Trivy full JSON report'
+      condition: always()
+
+    - publish: '$(Build.ArtifactStagingDirectory)/trivy-report.json'
+      artifact: trivy-security-report
+      displayName: 'Publish Trivy report'
+      condition: always()
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 6 — DOCKER PUSH
+# Only runs if Trivy scan passed — ensures only secure images
+# are pushed to ACR.
+# ─────────────────────────────────────────────────────────────
+- stage: DockerPush
+  displayName: '6 · Docker Push'
+  dependsOn: Trivy
+  condition: succeeded()
+  jobs:
+  - job: PushImage
+    displayName: 'Push verified image to ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - download: current
+      artifact: docker-image
+      displayName: 'Download image tar'
+
+    - script: |
+        docker load < $(Pipeline.Workspace)/docker-image/cartservice-image.tar.gz
+        echo "Loaded: $(IMAGE_FULL)"
+      displayName: 'Load Docker image'
+
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command:           'login'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+
+    - task: Docker@2
+      displayName: 'Push image to ACR'
+      inputs:
+        command:           'push'
+        containerRegistry: 'ACR_SERVICE_CONNECTION'
+        repository:        '$(IMAGE_NAME)'
+        tags:              '$(IMAGE_TAG)'
+
+    - script: |
+        echo "Successfully pushed: $(IMAGE_FULL)"
+        echo "##vso[task.setvariable variable=IMAGE_DIGEST;isOutput=true]$(IMAGE_FULL)"
+      displayName: 'Confirm push'
+      name: SetDigest
