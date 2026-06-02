@@ -1,0 +1,68 @@
+# ============================================================
+# Deployment — cartservice
+# Language: .NET (C#)
+# Protocol: gRPC
+# Port: 7070
+# Depends on: valkey-cart (Redis-compatible cache)
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cartservice
+  labels:
+    app: cartservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cartservice
+  template:
+    metadata:
+      labels:
+        app: cartservice
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: cartservice
+        image: myacr.azurecr.io/cartservice:latest
+        ports:
+        - name: grpc
+          containerPort: 7070
+          protocol: TCP
+
+        env:
+        - name: CART_PORT
+          value: "7070"
+
+        # Valkey is a Redis-compatible cache used by cartservice
+        # Deploy valkey-cart separately or use Azure Cache for Redis
+        - name: VALKEY_ADDR
+          value: "valkey-cart:6379"
+
+        - name: FLAGD_HOST
+          value: "flagd"
+
+        - name: FLAGD_PORT
+          value: "8013"
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "160Mi"
+
+        readinessProbe:
+          grpc:
+            port: 7070
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+
+        livenessProbe:
+          grpc:
+            port: 7070
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3

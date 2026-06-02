@@ -1,0 +1,67 @@
+# ============================================================
+# Deployment — recommendationservice
+# Language: Python
+# Protocol: gRPC
+# Port: 9001
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendationservice
+  labels:
+    app: recommendationservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recommendationservice
+  template:
+    metadata:
+      labels:
+        app: recommendationservice
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: recommendationservice
+        image: myacr.azurecr.io/recommendationservice:latest
+        ports:
+        - name: grpc
+          containerPort: 9001
+          protocol: TCP
+
+        env:
+        - name: RECOMMENDATION_PORT
+          value: "9001"
+
+        # Calls productcatalogservice internally
+        - name: PRODUCT_CATALOG_ADDR
+          value: "productcatalogservice:3550"
+
+        # Feature flag service
+        - name: FLAGD_HOST
+          value: "flagd"
+
+        - name: FLAGD_PORT
+          value: "8013"
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "500Mi"
+
+        readinessProbe:
+          grpc:
+            port: 9001
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+
+        livenessProbe:
+          grpc:
+            port: 9001
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3

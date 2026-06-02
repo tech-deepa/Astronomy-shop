@@ -1,0 +1,98 @@
+# ============================================================
+# Deployment — frontend
+# Language: TypeScript (Next.js)
+# Protocol: HTTP
+# Port: 8080
+# Note: frontend is the only service exposed externally
+#       via frontendproxy (Envoy). Do NOT expose directly.
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: frontend
+        image: myacr.azurecr.io/frontend:latest
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+
+        env:
+        - name: FRONTEND_PORT
+          value: "8080"
+
+        # Internal service addresses
+        - name: CART_ADDR
+          value: "cartservice:7070"
+
+        - name: PRODUCT_CATALOG_ADDR
+          value: "productcatalogservice:3550"
+
+        - name: RECOMMENDATION_ADDR
+          value: "recommendationservice:9001"
+
+        - name: CHECKOUT_ADDR
+          value: "checkoutservice:5050"
+
+        - name: AD_ADDR
+          value: "adservice:9555"
+
+        - name: CURRENCY_ADDR
+          value: "currencyservice:7001"
+
+        - name: SHIPPING_ADDR
+          value: "shippingservice:50050"
+
+        - name: FLAGD_HOST
+          value: "flagd"
+
+        - name: FLAGD_PORT
+          value: "8013"
+
+        # Public URL — update per environment
+        - name: PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+          value: "http://localhost:8080/otlp-http/v1/traces"
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "250Mi"
+
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+            httpHeaders:
+            - name: "Cookie"
+              value: "shop_session-id=x-readiness-probe"
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+            httpHeaders:
+            - name: "Cookie"
+              value: "shop_session-id=x-liveness-probe"
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3

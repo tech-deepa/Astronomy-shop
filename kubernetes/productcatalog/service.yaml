@@ -1,0 +1,19 @@
+# ============================================================
+# Service — productcatalogservice
+# ClusterIP: called by frontend, checkout, recommendation
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: productcatalogservice
+  labels:
+    app: productcatalogservice
+spec:
+  type: ClusterIP
+  selector:
+    app: productcatalogservice
+  ports:
+  - name: grpc
+    port: 3550
+    targetPort: 3550
+    protocol: TCP

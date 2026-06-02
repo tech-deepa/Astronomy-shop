@@ -1,0 +1,62 @@
+# ============================================================
+# Deployment — productcatalogservice
+# Language: Go
+# Protocol: gRPC
+# Port: 3550
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: productcatalogservice
+  labels:
+    app: productcatalogservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: productcatalogservice
+  template:
+    metadata:
+      labels:
+        app: productcatalogservice
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: productcatalogservice
+        image: myacr.azurecr.io/productcatalogservice:latest
+        ports:
+        - name: grpc
+          containerPort: 3550
+          protocol: TCP
+
+        env:
+        - name: PRODUCT_CATALOG_PORT
+          value: "3550"
+
+        - name: FLAGD_HOST
+          value: "flagd"
+
+        - name: FLAGD_PORT
+          value: "8013"
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "128Mi"
+
+        readinessProbe:
+          grpc:
+            port: 3550
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+
+        livenessProbe:
+          grpc:
+            port: 3550
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3

@@ -1,0 +1,21 @@
+# ============================================================
+# Service — frontend
+# ClusterIP: accessed internally by frontendproxy (Envoy)
+# Do NOT change to LoadBalancer — use frontendproxy for
+# external access, not this service directly
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: frontend
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

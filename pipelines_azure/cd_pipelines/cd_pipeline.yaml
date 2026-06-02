@@ -1,0 +1,137 @@
+# ============================================================
+# CD Pipeline — All Services
+# Triggered automatically by CI pipeline completion
+# Dev     → Auto
+# QA      → Manual approval (set in Azure DevOps Environments UI)
+# Staging → Manual approval
+# Prod    → Manual approval
+# ============================================================
+
+trigger: none
+
+# Triggers when CI pipeline completes on main
+resources:
+  pipelines:
+  - pipeline: ci_adservice
+    source: 'ci-adservice'
+    trigger:
+      branches:
+        include:
+          - main
+
+  - pipeline: ci_cartservice
+    source: 'ci-cartservice'
+    trigger:
+      branches:
+        include:
+          - main
+
+  - pipeline: ci_checkoutservice
+    source: 'ci-checkoutservice'
+    trigger:
+      branches:
+        include:
+          - main
+
+  - pipeline: ci_frontend
+    source: 'ci-frontend'
+    trigger:
+      branches:
+        include:
+          - main
+
+  - pipeline: ci_recommendationservice
+    source: 'ci-recommendationservice'
+    trigger:
+      branches:
+        include:
+          - main
+
+  - pipeline: ci_productcatalogservice
+    source: 'ci-productcatalogservice'
+    trigger:
+      branches:
+        include:
+          - main
+
+
+# These appear as dropdown + input in Azure DevOps Run Pipeline UI
+parameters:
+  - name: serviceName
+    type: string
+    displayName: 'Service to Deploy'
+    default: 'adservice'
+    values:
+      - adservice
+      - cartservice
+      - frontend
+      - recommendationservice
+      - productcatalogservice
+
+  - name: imageTag
+    type: string
+    displayName: 'Image Tag (Build ID from CI)'
+    default: '$(Build.BuildId)'
+
+variables:
+  acrRegistry: 'myacr.azurecr.io'          # ← match your CI
+  aksServiceConnection: 'aks-service-connection'  # ← match your CI
+
+# ── DEV: Auto, no approval needed ──────────────────────────
+stages:
+- stage: Deploy_Dev
+  displayName: '🚀 Dev — Auto'
+  jobs:
+  - template: ../templates/deploy-template.yml
+    parameters:
+      serviceName: ${{ parameters.serviceName }}
+      namespace: dev
+      environment: dev
+      imageTag: ${{ parameters.imageTag }}
+      acrRegistry: $(acrRegistry)
+      aksServiceConnection: $(aksServiceConnection)
+
+# ── QA: Pauses for manual approval in Azure DevOps UI ──────
+- stage: Deploy_QA
+  displayName: '⏸ QA — Manual Approval'
+  dependsOn: Deploy_Dev
+  condition: succeeded()
+  jobs:
+  - template: ../templates/deploy-template.yml
+    parameters:
+      serviceName: ${{ parameters.serviceName }}
+      namespace: qa
+      environment: qa
+      imageTag: ${{ parameters.imageTag }}
+      acrRegistry: $(acrRegistry)
+      aksServiceConnection: $(aksServiceConnection)
+
+# ── STAGING: Pauses for manual approval ────────────────────
+- stage: Deploy_Staging
+  displayName: '⏸ Staging — Manual Approval'
+  dependsOn: Deploy_QA
+  condition: succeeded()
+  jobs:
+  - template: ../templates/deploy-template.yml
+    parameters:
+      serviceName: ${{ parameters.serviceName }}
+      namespace: staging
+      environment: staging
+      imageTag: ${{ parameters.imageTag }}
+      acrRegistry: $(acrRegistry)
+      aksServiceConnection: $(aksServiceConnection)
+
+# ── PROD: Pauses for manual approval ───────────────────────
+- stage: Deploy_Prod
+  displayName: '⏸ Prod — Manual Approval'
+  dependsOn: Deploy_Staging
+  condition: succeeded()
+  jobs:
+  - template: ../templates/deploy-template.yml
+    parameters:
+      serviceName: ${{ parameters.serviceName }}
+      namespace: prod
+      environment: prod
+      imageTag: ${{ parameters.imageTag }}
+      acrRegistry: $(acrRegistry)
+      aksServiceConnection: $(aksServiceConnection)

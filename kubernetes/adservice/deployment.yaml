@@ -1,0 +1,61 @@
+# ============================================================
+# Deployment — adservice
+# Java gRPC service, port 9555
+# Image pulled from ACR, tag injected by CD pipeline
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adservice
+  labels:
+    app: adservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adservice
+  template:
+    metadata:
+      labels:
+        app: adservice
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: adservice
+        # Image is overridden by CD pipeline:
+        # $(acrRegistry)/adservice:$(Build.BuildId)
+        image: myacr.azurecr.io/adservice:latest
+        ports:
+        - name: grpc
+          containerPort: 9555
+          protocol: TCP
+
+        # ── Environment Variables ──────────────────────────
+        env:
+        - name: AD_PORT
+          value: "9555"
+
+        # ── Resource Limits ────────────────────────────────
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+        # ── Health Checks ──────────────────────────────────
+        # adservice uses gRPC health protocol
+        readinessProbe:
+          grpc:
+            port: 9555
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+
+        livenessProbe:
+          grpc:
+            port: 9555
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3

@@ -1,0 +1,20 @@
+# ============================================================
+# Service — adservice
+# ClusterIP: internal only, other services call it via gRPC
+# adservice is not exposed externally
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: adservice
+  labels:
+    app: adservice
+spec:
+  type: ClusterIP
+  selector:
+    app: adservice
+  ports:
+  - name: grpc
+    port: 9555
+    targetPort: 9555
+    protocol: TCP

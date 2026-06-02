@@ -1,0 +1,76 @@
+# ============================================================
+# Reusable Deploy Template
+# Used by cd-pipeline.yml for all services
+# Params: serviceName, namespace, environment, imageTag,
+#         acrRegistry, aksServiceConnection
+# ============================================================
+
+parameters:
+  - name: serviceName
+    type: string
+  - name: namespace
+    type: string
+  - name: environment
+    type: string
+  - name: imageTag
+    type: string
+  - name: acrRegistry
+    type: string
+  - name: aksServiceConnection
+    type: string
+
+pool:
+    name: azureagent
+        
+jobs:
+- deployment: Deploy
+  displayName: 'Deploy ${{ parameters.serviceName }} → ${{ parameters.environment }}'
+  
+  environment: '${{ parameters.environment }}'
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+
+        # ── Checkout repo to access k8s manifests ──────────
+        - checkout: self
+
+        # ── Replace image tag in deployment manifest ───────
+        - script: |
+            sed -i 's|${{ parameters.acrRegistry }}/${{ parameters.serviceName }}:latest|${{ parameters.acrRegistry }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}|g' \
+            k8s/${{ parameters.serviceName }}/deployment.yaml
+          displayName: 'Set image tag in manifest'
+
+        # ── Deploy to AKS ──────────────────────────────────
+        - task: KubernetesManifest@1
+          displayName: 'Deploy ${{ parameters.serviceName }}'
+          inputs:
+            action: deploy
+            connectionType: kubernetesServiceConnection
+            kubernetesServiceConnection: '${{ parameters.aksServiceConnection }}'
+            namespace: '${{ parameters.namespace }}'
+            manifests: |
+              k8s/${{ parameters.serviceName }}/deployment.yaml
+              k8s/${{ parameters.serviceName }}/service.yaml
+            containers: '${{ parameters.acrRegistry }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}'
+
+        # ── Verify rollout succeeded ───────────────────────
+        - task: Kubernetes@1
+          displayName: 'Verify rollout'
+          inputs:
+            connectionType: kubernetesServiceConnection
+            kubernetesServiceConnection: '${{ parameters.aksServiceConnection }}'
+            namespace: '${{ parameters.namespace }}'
+            command: rollout
+            arguments: 'status deployment/${{ parameters.serviceName }} --timeout=5m'
+
+        # ── Auto rollback if deploy failed ─────────────────
+        - task: Kubernetes@1
+          displayName: 'Rollback on failure'
+          condition: failed()
+          inputs:
+            connectionType: kubernetesServiceConnection
+            kubernetesServiceConnection: '${{ parameters.aksServiceConnection }}'
+            namespace: '${{ parameters.namespace }}'
+            command: rollout
+            arguments: 'undo deployment/${{ parameters.serviceName }}'

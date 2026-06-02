@@ -1,0 +1,19 @@
+# ============================================================
+# Service — recommendationservice
+# ClusterIP: internal only, called by frontend via gRPC
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendationservice
+  labels:
+    app: recommendationservice
+spec:
+  type: ClusterIP
+  selector:
+    app: recommendationservice
+  ports:
+  - name: grpc
+    port: 9001
+    targetPort: 9001
+    protocol: TCP
